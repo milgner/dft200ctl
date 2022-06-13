@@ -1,68 +1,110 @@
+use std::collections::HashSet;
+use std::thread;
 use std::time::Duration;
-use btleplug::api::ScanFilter;
-use tokio::time;
-use itertools::Itertools;
-use btleplug::api::{Central, Manager as _, Peripheral as _};
-use btleplug::platform::{Manager, Peripheral};
+use bluer::{AdapterEvent, Address, Device};
+use futures::{pin_mut, StreamExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::{sleep, timeout},
+};
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::RecvError;
+
 use uuid::Uuid;
 
 lazy_static! {
     static ref TREADMILL_SERVICE_UUID: Uuid = Uuid::parse_str("0000fff0-0000-1000-8000-00805f9b34fb").unwrap();
 }
 
-async fn find_peripherals(scan_duration: Duration) -> Result<Vec<Peripheral>, btleplug::Error> {
-    let adapters = Manager::new().await?.adapters().await?;
-    futures::future::join_all(adapters.into_iter().map(|adapter| async move {
-        tracing::debug!("Starting scan on {}", adapter.adapter_info().await?);
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .expect("Can't scan BLE adapter for connected devices");
-        time::sleep(scan_duration).await;
-        adapter.peripherals().await
-    })).await.into_iter().flatten_ok().collect()
+#[derive(Debug)]
+pub enum Error {
+    BluerError(bluer::Error),
+    Unspecific
+}
+
+impl From<()> for Error {
+    fn from(_: ()) -> Self {
+        Self::Unspecific
+    }
+}
+
+impl From<bluer::Error> for Error {
+    fn from(err: bluer::Error) -> Self {
+        Self::BluerError(err)
+    }
 }
 
 
-pub async fn find_treadmills(scan_duration: Duration) -> Result<Vec<Peripheral>, btleplug::Error> {
-    let mut treadmills = Vec::new();
-    for peripheral in find_peripherals(scan_duration).await? {
-        let properties = peripheral.properties().await?;
-        let is_connected = peripheral.is_connected().await?;
-        let local_name = properties
-            .unwrap()
-            .local_name
-            .unwrap_or(String::from("(peripheral name unknown)"));
-        tracing::debug!(
-                "Peripheral {:?} is connected: {:?}",
-                local_name, is_connected
-            );
-        if !is_connected {
-            tracing::debug!("Connecting to peripheral {:?}", &local_name);
-            if let Err(err) = peripheral.connect().await {
-                tracing::warn!("Error connecting to peripheral, skipping: {}", err);
-                continue;
+async fn is_treadmill(device: &Device) -> Result<bool, Error> {
+    let treadmill = device.uuids().await?
+        .unwrap_or_default()
+        .into_iter()
+        .any(|uuid| uuid.as_u128() == TREADMILL_SERVICE_UUID.as_u128());
+    if treadmill {
+        print_details(device);
+    }
+    Ok(treadmill)
+}
+
+#[cfg(not(debug_assertions))]
+async fn print_details(device: &Device) -> Result<(), Error> {
+    Ok(())
+}
+
+// Service: 00001801-0000-1000-8000-00805f9b34fb (8)
+// Service: 0000180a-0000-1000-8000-00805f9b34fb (9)
+// Characteristics: 00002a29-0000-1000-8000-00805f9b34fb (10)
+// Characteristics: 00002a23-0000-1000-8000-00805f9b34fb (12)
+// Service: 0000fff0-0000-1000-8000-00805f9b34fb (14)
+// Characteristics: 0000fff2-0000-1000-8000-00805f9b34fb (18)
+// Characteristics: 0000fff1-0000-1000-8000-00805f9b34fb (15)
+// Descriptor: Descriptor { adapter_name: hci0, device_address: DF:D6:EB:3F:2D:D0, service_id: 14, characteristic_id: 15, id: 17 }
+// Property: Uuid(00002902-0000-1000-8000-00805f9b34fb)
+// Property: CachedValue([])
+#[cfg(debug_assertions)]
+async fn print_details(device: &Device) -> Result<(), Error> {
+    device.connect().await?;
+    for service in device.services().await? {
+        println!("Service: {} ({})", service.uuid().await?, service.id());
+        let characteristics = service.characteristics().await.unwrap_or_default();
+        for characteristic in characteristics {
+            println!("Characteristics: {:?} ({})", characteristic.uuid().await?, characteristic.id());
+            for descriptor in characteristic.descriptors().await? {
+                println!("Descriptor: {:?}", descriptor);
+                for prop in descriptor.all_properties().await? {
+                    println!("Property: {:?}", prop);
+                }
             }
         }
-        let is_connected = peripheral.is_connected().await?;
-        tracing::debug!(
-                "Now connected ({:?}) to peripheral {:?}",
-                is_connected, &local_name
-            );
-        peripheral.discover_services().await?;
-        let services = peripheral.services();
-        let has_service: bool = services.iter().any(|s| s.uuid == *TREADMILL_SERVICE_UUID);
-        if is_connected {
-            tracing::debug!("Disconnecting from peripheral {:?}", &local_name);
-            peripheral
-                .disconnect()
-                .await
-                .expect("Error disconnecting from BLE peripheral");
-        }
-        if has_service {
-            treadmills.push(peripheral)
+    }
+    Ok(())
+}
+
+// Scan for new device. Every new device will be checked whether it is a treadmill.
+// It is assumed that one will stay in proximity to the treadmill and as such,
+// `DeviceRemoved` events will be ignored.
+// If a device is indeed removed (i.e. unplugged or otherwise becomes unavailable),
+// downstream code will detect connection issues and deal with it.
+pub async fn find_treadmill() -> Result<Device, Error> {
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    tracing::info!("Discovering devices using Bluetooth adapter {}\n", adapter.name());
+    adapter.set_powered(true).await?;
+
+    let device_events = adapter.discover_devices().await?;
+    pin_mut!(device_events);
+
+    while let Some(device_event) = device_events.next().await {
+        match device_event {
+            AdapterEvent::DeviceAdded(addr) => {
+                tracing::info!("Device added: {}", addr);
+                let device = adapter.device(addr)?;
+                if is_treadmill(&device).await? {
+                    return Ok(device)
+                }
+            }
+            _ => (),
         }
     }
-
-    Ok(treadmills)
+    unreachable!()
 }
